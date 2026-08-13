@@ -3,6 +3,16 @@
 set -euo pipefail
 
 OUTPUT_DIR="$HOME/Documents/ChatGPT"
+
+fail() {
+    print -u2 "Error: $1"
+    exit 1
+}
+
+if ! command -v osascript >/dev/null 2>&1; then
+    fail "osascript が見つかりません。macOS上で実行してください。"
+fi
+
 mkdir -p "$OUTPUT_DIR"
 
 PAGE_URL=$(osascript <<'APPLESCRIPT'
@@ -13,7 +23,7 @@ tell application "Safari"
     return URL of current tab of front window
 end tell
 APPLESCRIPT
-)
+) || fail "Safariの最前面タブを取得できませんでした。"
 
 if [[ "$PAGE_URL" != https://chatgpt.com/* ]]; then
     print -u2 "Error: Safariの最前面タブがChatGPTではありません。"
@@ -26,7 +36,7 @@ tell application "Safari"
     return do JavaScript "document.title" in current tab of front window
 end tell
 APPLESCRIPT
-)
+) || fail "ChatGPTのタイトルを取得できませんでした。Safariの『Allow JavaScript from Apple Events』設定を確認してください。"
 
 MARKDOWN=$(osascript <<'APPLESCRIPT'
 tell application "Safari"
@@ -38,6 +48,44 @@ tell application "Safari"
 
             function normalizeText(text) {
                 return text.replace(/\\u00a0/g, ' ');
+            }
+
+            function looksLikePowerShell(code) {
+                return /(^|\\n)\\s*\\$[A-Za-z_]/.test(code)
+                    || /\\bAdd-Type\\b/.test(code)
+                    || /\\bNew-Object\\b/.test(code)
+                    || /\\bStart-Sleep\\b/.test(code)
+                    || /\\bGet-[A-Za-z]+\\b/.test(code)
+                    || /\\bSet-[A-Za-z]+\\b/.test(code)
+                    || /\\bWrite-[A-Za-z]+\\b/.test(code)
+                    || /\\[System\\./.test(code)
+                    || /-AssemblyName\\b/.test(code)
+                    || /-ComObject\\b/.test(code);
+            }
+
+            function languageMatches(label, code) {
+                switch (label) {
+                    case 'powershell':
+                        return looksLikePowerShell(code);
+                    case 'bash':
+                    case 'shell':
+                    case 'zsh':
+                        return /(^|\\n)\\s*(#!\\/|[A-Za-z_][A-Za-z0-9_]*=|echo\\b|printf\\b|cd\\b|export\\b|if \\[|for\\b|while\\b)/.test(code);
+                    case 'python':
+                        return /(^|\\n)\\s*(def |class |import |from .+ import |print\\()/.test(code);
+                    case 'javascript':
+                    case 'typescript':
+                        return /(^|\\n)\\s*(const |let |var |function |class |import |export )/.test(code);
+                    case 'json':
+                        try {
+                            JSON.parse(code);
+                            return true;
+                        } catch (_) {
+                            return false;
+                        }
+                    default:
+                        return true;
+                }
             }
 
             function detectLanguage(codeNode, code) {
@@ -85,16 +133,20 @@ tell application "Safari"
                 const firstNonEmpty = lines.findIndex(line => line.trim() !== '');
 
                 if (firstNonEmpty >= 0) {
-                    const label = lines[firstNonEmpty].trim().toLowerCase();
-                    if (aliases[label]) {
-                        lines.splice(firstNonEmpty, 1);
-                        while (lines.length && lines[0].trim() === '') {
-                            lines.shift();
+                    const rawLabel = lines[firstNonEmpty].trim().toLowerCase();
+                    const language = aliases[rawLabel];
+
+                    if (language) {
+                        const candidate = [...lines];
+                        candidate.splice(firstNonEmpty, 1);
+                        while (candidate.length && candidate[0].trim() === '') {
+                            candidate.shift();
                         }
-                        return {
-                            language: aliases[label],
-                            code: lines.join('\\n')
-                        };
+                        const candidateCode = candidate.join('\\n');
+
+                        if (languageMatches(rawLabel, candidateCode)) {
+                            return { language, code: candidateCode };
+                        }
                     }
                 }
 
@@ -233,6 +285,10 @@ tell application "Safari"
                 }
             }
 
+            if (promptNo === 0 && responseNo === 0) {
+                throw new Error('エクスポート可能な会話が見つかりません。');
+            }
+
             return parts.join('\\n').trim() + '\\n';
         })()
     "
@@ -240,18 +296,21 @@ tell application "Safari"
     return do JavaScript jsCode in current tab of front window
 end tell
 APPLESCRIPT
-)
+) || fail "ChatGPT会話のMarkdown変換に失敗しました。"
 
 SAFE_TITLE=$(printf '%s' "$PAGE_TITLE" \
     | tr '/:' '__' \
     | tr '\n\r\t' '   ' \
-    | sed -E 's/[[:space:]]+$//; s/^[[:space:]]+//')
+    | sed -E 's/[[:cntrl:]]//g; s/[[:space:]]+$//; s/^[[:space:]]+//')
 
 if [[ -z "$SAFE_TITLE" ]]; then
     SAFE_TITLE="ChatGPT"
 fi
 
 OUTPUT_FILE="$OUTPUT_DIR/$SAFE_TITLE.md"
-printf '%s\n' "$MARKDOWN" > "$OUTPUT_FILE"
 
-print "Saved: $OUTPUT_FILE"
+if ! printf '%s\n' "$MARKDOWN" > "$OUTPUT_FILE"; then
+    fail "Markdownファイルを保存できませんでした: $OUTPUT_FILE"
+fi
+
+print "$OUTPUT_FILE"
